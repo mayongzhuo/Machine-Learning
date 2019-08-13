@@ -1,0 +1,15 @@
+#os
+os.name
+os.environ
+os.sep
+os.pathsep
+os.cpu_count()
+os.getenv()
+os.getpid()
+os.getppid()
+os.getlogin()
+os.urandom()
+os.startfile()
+
+
+#sys
