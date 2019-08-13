@@ -1,0 +1,179 @@
+import os
+import sys
+import random
+import math
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import json
+import pydicom
+from imgaug import augmenters as iaa
+from tqdm import tqdm
+import pandas as pd
+import glob
+from sklearn.model_selection import KFold
+
+DATA_DIR="D:/medical_data"
+ROOT_DIR="D:/"
+
+sys.path.append(os.path.join(ROOT_DIR,"Mask_RCNN"))
+from mrcnn.config import Config
+from mrcnn import utils
+import mrcnn.model as modellib
+from mrcnn import visualize
+from mrcnn.model import log
+
+train_dicom_dir=os.path.join(DATA_DIR,"stage_2_train_images")
+test_dicom_dir=os.path.join(DATA_DIR,"stage_2_test_images")
+
+COCO_WEIGHTS_PATH="D:/Mask_RCNN/mask_rcnn_coco.h5"
+
+def get_dicom_fps(dicom_dir):
+    dicom_fps=glob.glob(dicom_dir+"/"+"*.dcm")
+    return list(set(dicom_fps))
+def parse_dataset(dicom_dir,anns):
+    image_fps=get_dicom_fps(dicom_dir)
+    image_annotations={fp:[] for fp in image_fps}
+    for index,row in anns.iterrows():
+        fp=os.path.join(dicom_dir,row["patientId"]+".dcm")
+        image_annotations[fp].append(row)
+    return image_fps,image_annotations
+
+class DetectorConfig(Config):
+    NAME="pneumonia"
+    GPU_COUNT=1
+    IMAGES_PER_GPU=8
+    BACKBONE="resnet50"
+    NUM_CLASSES=2
+    IMAGE_MIN_DIM=256
+    IMAGE_MAX_DIM=256
+    RPN_ANCHOR_SCALES=(16,32,64,128)
+    TRAIN_ROIS_PER_IMAGE=32
+    MAX_GT_INSTANCES=4
+    DETECTION_MAX_INSTANCES=3
+    DETECTION_MIN_CONFINDENCE=0.78
+    DETECTION_NMS_THRESHOLD=0.01
+    STEPS_PER_EPOCH=200
+config=DetectorConfig()
+
+class DetectorDataset(utils.Dataset):
+    def __init__(self,image_fps,image_annotations,orig_height,orig_width):
+        super().__init__(self)
+        self.add_class("pneumonia",1,"Lung Opacity")
+        for i,fp in enumerate(image_fps):
+            annotations=image_annotations[fp]
+            self.add_image("pneumonia",image_id=i,path=fp,
+                           annotations=annotations,orig_height=orig_height,
+                           orig_width=orig_width)
+    def image_reference(self,image_id):
+        info=self.image_info[image_id]
+        return  info["path"]
+    def load_image(self,image_id):
+        info=self.image_info[image_id]
+        fp=info["path"]
+        ds=pydicom.read_file(fp)
+        image=ds.pixel_array
+        if len(image.shape) !=3 or image.shape[2] !=3:
+            image=np.stack((image,)*3,-1)
+        return image
+    def load_mask(self,image_id):
+        info=self.image_info[image_id]
+        annotations=info["annotations"]
+        count=len(annotations)
+        if count==0:
+            mask=np.zeros((info["orig_height"],info["orig_width"],1),dtype=np.uint8)
+            class_ids=np.zeros((1,),dtype=np.int32)
+        else:
+            mask=np.zeros((info["orig_height"],info["orig_width"],count),dtype=np.uint8)
+            class_ids=np.zeros((count,),dtype=np.int32)
+            for i,a in enumerate(annotations):
+                if a["Target"]==1:
+                    x=int(a["x"])
+                    y=int(a["y"])
+                    w=int(a["width"])
+                    h=int(a["height"])
+                    mask_instance=mask[:,:,i].copy()
+                    cv2.rectangle(mask_instance,(x,y),(x+w,y+h),255,-1)
+                    mask[:,:,i]=mask_instance
+                    class_ids[i]=1
+        return  mask.astype(np.bool),class_ids.astype(np.int32)
+
+anns=pd.read_csv(os.path.join(DATA_DIR,"stage_2_train_labels.csv"))
+
+image_fps,image_annotations=parse_dataset(train_dicom_dir,anns=anns)
+ds=pydicom.read_file(image_fps[0])
+image=ds.pixel_array
+
+ORIG_SIZE=1024
+image_fps_list=list(image_fps)
+random.seed(42)
+random.shuffle(image_fps_list)
+val_size=1500
+image_fps_val=image_fps_list[:val_size]
+image_fps_train=image_fps_list[val_size:]
+
+dataset_train=DetectorDataset(image_fps_train,image_annotations,ORIG_SIZE,ORIG_SIZE)
+dataset_train.prepare()
+
+test_fp=random.choice(image_fps_train)
+image_annotations[test_fp]
+
+dataset_val=DetectorDataset(image_fps_val,image_annotations,ORIG_SIZE,ORIG_SIZE)
+dataset_val.prepare()
+
+class_ids=[0]
+while class_ids[0]==0:
+    image_id=random.choice(dataset_train.image_ids)#出错
+    image_fp=dataset_train.image_reference(image_id)
+    image=dataset_train.load_image(image_id)
+    mask,class_ids=dataset_train.load_mask(image_id)
+
+masked=np.zeros(image.shape[:2])
+for i in range(mask.shape[2]):
+    masked+=image[:,:,0]*mask[:,:,i]
+
+augmentation = iaa.Sequential([
+    iaa.OneOf([ ## geometric transform
+        iaa.Affine(
+            scale={"x": (0.98, 1.02), "y": (0.98, 1.04)},
+            translate_percent={"x": (-0.02, 0.02), "y": (-0.04, 0.04)},
+            rotate=(-2, 2),
+            shear=(-1, 1),
+        ),
+        iaa.PiecewiseAffine(scale=(0.001, 0.025)),
+    ]),
+    iaa.OneOf([ ## brightness or contrast
+        iaa.Multiply((0.9, 1.1)),
+        iaa.ContrastNormalization((0.9, 1.1)),
+    ]),
+    iaa.OneOf([ ## blur or sharpen
+        iaa.GaussianBlur(sigma=(0.0, 0.1)),
+        iaa.Sharpen(alpha=(0.0, 0.1)),
+    ]),
+])
+
+# test on the same image as above
+imggrid = augmentation.draw_grid(image[:, :, 0], cols=5, rows=2)
+
+model=modellib.MaskRCNN(mode="training",config=config,model_dir=ROOT_DIR)
+model.load_weights(COCO_WEIGHTS_PATH,by_name=True,exclude=["mrcnn_class_logits", "mrcnn_bbox_fc","mrcnn_bbox", "mrcnn_mask"])
+
+LEARNING_RATE=0.006
+import warnings
+warnings.filterwarnings("ignore")
+
+model.train(dataset_train,dataset_val,learning_rate=LEARNING_RATE*2,epochs=2,layers='heads',augmentation=None)
+history=model.keras_model.history.history
+
+# model.train(dataset_train, dataset_val,learning_rate=LEARNING_RATE,epochs=6,layers='all',augmentation=augmentation)
+# new_history = model.keras_model.history.history
+# for k in new_history: history[k] = history[k] + new_history[k]
+
+# model.train(dataset_train, dataset_val,learning_rate=LEARNING_RATE/5,epochs=16,layers='all',augmentation=augmentation)
+# new_history = model.keras_model.history.history
+# for k in new_history: history[k] = history[k] + new_history[k]
+
+epochs=range(1,len(next(iter(history.values())))+1)
+pd.DataFrame(history,index=epochs)
+
+best_epoch = np.argmin(history["val_loss"])
