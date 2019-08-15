@@ -13,3 +13,13 @@ os.startfile()
 
 
 #sys
+sys.argv
+sys.path
+sys.modules
+sys.platform
+sys.flags
+sys.getfilesystemencoding()
+sys.byteorder
+sys.executable
+sys.maxsize
+sys.implementation
