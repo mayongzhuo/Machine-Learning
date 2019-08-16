@@ -23,3 +23,9 @@ sys.byteorder
 sys.executable
 sys.maxsize
 sys.implementation
+
+
+
+#random
+random.shuffle()
+random.choice()
