@@ -13,7 +13,8 @@ tf.assert_integer()
 
 
 
-
+tf.gfile.FastGFile()
+tf.image.decode_jpeg()
 
 
 
